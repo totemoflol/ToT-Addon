@@ -4,9 +4,9 @@
   "version": "${version}",
   "name": "ToT",
   "description": "Spawner Saver addon for Meteor Client.",
-  "authors": ["YourName"],
+  "authors": ["totemoflol"],
   "contact": {
-    "sources": "https://github.com/yourusername/tot-addon"
+    "sources": "https://github.com/totemoflol/tot-addon"
   },
   "license": "MIT",
   "icon": "assets/tot/icon.png",
