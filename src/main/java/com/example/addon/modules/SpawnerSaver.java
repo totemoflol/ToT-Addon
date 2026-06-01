@@ -1,6 +1,8 @@
 package com.tot.addon.modules;
 
 import com.tot.addon.Categories;
+import baritone.api.BaritoneAPI;
+import baritone.api.pathing.goals.GoalNear;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
@@ -8,7 +10,6 @@ import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.block.Blocks;
-import net.minecraft.client.option.KeyBinding;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.ItemEnchantmentsComponent;
 import net.minecraft.enchantment.Enchantments;
@@ -71,7 +72,7 @@ public class SpawnerSaver extends Module {
 
     private final Setting<Boolean> autoNavigate = sgBehavior.add(new BoolSetting.Builder()
         .name("auto-navigate")
-        .description("Walk toward spawners or ender chest if out of reach.")
+        .description("Use Baritone to pathfind to spawners and ender chests.")
         .defaultValue(true)
         .build());
 
@@ -101,14 +102,13 @@ public class SpawnerSaver extends Module {
 
     // ─── Internal State ───────────────────────────────────────────────────────
 
-    private enum State { IDLE, MINING, DEPOSITING, NAVIGATING }
+    private enum State { IDLE, MINING, DEPOSITING, NAVIGATING_SPAWNER, NAVIGATING_CHEST }
 
     private State    state         = State.IDLE;
     private BlockPos targetSpawner = null;
     private BlockPos targetChest   = null;
     private int      mineTimer     = 0;
     private boolean  sneaking      = false;
-    private State    navReturnTo   = State.IDLE;
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
@@ -131,7 +131,7 @@ public class SpawnerSaver extends Module {
     @Override
     public void onDeactivate() {
         stopSneak();
-        stopWalk();
+        stopBaritone();
     }
 
     // ─── Main Tick ────────────────────────────────────────────────────────────
@@ -140,18 +140,16 @@ public class SpawnerSaver extends Module {
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
 
-        // If no threat, go idle and stop everything
         if (!threatDetected()) {
             if (state != State.IDLE) {
                 stopSneak();
-                stopWalk();
+                stopBaritone();
                 state = State.IDLE;
                 notify("No threat – standing by.");
             }
             return;
         }
 
-        // If inventory is full, switch to depositing
         if (pauseWhenFull.get() && inventoryFull() && state == State.MINING) {
             stopSneak();
             state = State.DEPOSITING;
@@ -160,10 +158,11 @@ public class SpawnerSaver extends Module {
         }
 
         switch (state) {
-            case IDLE       -> tickIdle();
-            case MINING     -> tickMining();
-            case DEPOSITING -> tickDepositing();
-            case NAVIGATING -> tickNavigating();
+            case IDLE                -> tickIdle();
+            case MINING              -> tickMining();
+            case DEPOSITING          -> tickDepositing();
+            case NAVIGATING_SPAWNER  -> tickNavSpawner();
+            case NAVIGATING_CHEST    -> tickNavChest();
         }
     }
 
@@ -178,8 +177,8 @@ public class SpawnerSaver extends Module {
 
         if (distTo(targetSpawner) > mineRange.get()) {
             if (autoNavigate.get()) {
-                navReturnTo = State.MINING;
-                state = State.NAVIGATING;
+                navigateTo(targetSpawner);
+                state = State.NAVIGATING_SPAWNER;
                 notify("Navigating to spawner @ " + targetSpawner.toShortString());
             }
         } else {
@@ -200,7 +199,6 @@ public class SpawnerSaver extends Module {
     private void tickMining() {
         if (targetSpawner == null) { state = State.IDLE; return; }
 
-        // Spawner already collected
         if (!isSpawner(targetSpawner)) {
             stopSneak();
             notify("Spawner collected.");
@@ -209,17 +207,15 @@ public class SpawnerSaver extends Module {
             return;
         }
 
-        // Out of reach – navigate
         if (distTo(targetSpawner) > mineRange.get()) {
             if (autoNavigate.get()) {
                 stopSneak();
-                navReturnTo = State.MINING;
-                state = State.NAVIGATING;
+                navigateTo(targetSpawner);
+                state = State.NAVIGATING_SPAWNER;
             }
             return;
         }
 
-        // Mine delay
         if (mineTimer > 0) { mineTimer--; return; }
         mineTimer = mineDelay.get();
 
@@ -234,58 +230,69 @@ public class SpawnerSaver extends Module {
         targetChest = nearestEnderChest();
 
         if (targetChest == null) {
-            notify("No ender chest found – resuming mining.");
+            notify("No ender chest found – resuming.");
             state = State.IDLE;
             return;
         }
 
         if (distTo(targetChest) > placeRange.get()) {
             if (autoNavigate.get()) {
-                navReturnTo = State.DEPOSITING;
-                state = State.NAVIGATING;
+                navigateTo(targetChest);
+                state = State.NAVIGATING_CHEST;
                 notify("Navigating to ender chest @ " + targetChest.toShortString());
             }
             return;
         }
 
-        // Open the ender chest
         mc.interactionManager.interactBlock(
             mc.player, Hand.MAIN_HAND,
-            new BlockHitResult(
-                Vec3d.ofCenter(targetChest),
-                facingToward(targetChest),
-                targetChest,
-                false
-            )
+            new BlockHitResult(Vec3d.ofCenter(targetChest), facingToward(targetChest), targetChest, false)
         );
 
-        // Shift-click all spawner items in (executes next tick via scheduler)
         shiftClickSpawners();
         notify("Deposited spawners into ender chest.");
         state = State.IDLE;
     }
 
-    // ─── State: NAVIGATING ────────────────────────────────────────────────────
+    // ─── State: NAVIGATING_SPAWNER ────────────────────────────────────────────
 
-    private void tickNavigating() {
-        BlockPos dest = (navReturnTo == State.MINING) ? targetSpawner : targetChest;
+    private void tickNavSpawner() {
+        if (targetSpawner == null) { state = State.IDLE; return; }
 
-        if (dest == null) {
-            stopWalk();
-            state = State.IDLE;
-            return;
+        if (distTo(targetSpawner) <= mineRange.get() - 0.5) {
+            stopBaritone();
+            state = State.MINING;
+            notify("Reached spawner.");
         }
+        // Baritone handles movement; nothing else needed here
+    }
 
-        double dist = distTo(dest);
-        double threshold = (navReturnTo == State.MINING) ? mineRange.get() - 0.5 : placeRange.get() - 0.5;
+    // ─── State: NAVIGATING_CHEST ──────────────────────────────────────────────
 
-        if (dist <= threshold) {
-            stopWalk();
-            state = navReturnTo;
-            return;
+    private void tickNavChest() {
+        if (targetChest == null) { state = State.IDLE; return; }
+
+        if (distTo(targetChest) <= placeRange.get() - 0.5) {
+            stopBaritone();
+            state = State.DEPOSITING;
+            notify("Reached ender chest.");
         }
+    }
 
-        walkToward(dest);
+    // ─── Baritone ─────────────────────────────────────────────────────────────
+
+    private void navigateTo(BlockPos dest) {
+        BaritoneAPI.getProvider()
+            .getPrimaryBaritone()
+            .getCustomGoalProcess()
+            .setGoalAndPath(new GoalNear(dest, 2));
+    }
+
+    private void stopBaritone() {
+        BaritoneAPI.getProvider()
+            .getPrimaryBaritone()
+            .getPathingBehavior()
+            .cancelEverything();
     }
 
     // ─── World Scanning ───────────────────────────────────────────────────────
@@ -335,11 +342,10 @@ public class SpawnerSaver extends Module {
     }
 
     private Direction facingToward(BlockPos p) {
-        Vec3d eye  = mc.player.getEyePos();
-        Vec3d diff = eye.subtract(Vec3d.ofCenter(p));
+        Vec3d diff = mc.player.getEyePos().subtract(Vec3d.ofCenter(p));
         double ax = Math.abs(diff.x), ay = Math.abs(diff.y), az = Math.abs(diff.z);
-        if (ax > ay && ax > az) return diff.x > 0 ? Direction.EAST : Direction.WEST;
-        if (ay > ax && ay > az) return diff.y > 0 ? Direction.UP   : Direction.DOWN;
+        if (ax > ay && ax > az) return diff.x > 0 ? Direction.EAST  : Direction.WEST;
+        if (ay > ax && ay > az) return diff.y > 0 ? Direction.UP    : Direction.DOWN;
         return diff.z > 0 ? Direction.SOUTH : Direction.NORTH;
     }
 
@@ -353,20 +359,15 @@ public class SpawnerSaver extends Module {
 
     private boolean equipSilkTool() {
         if (!requireSilkTouch.get()) return true;
-
-        // Check current main-hand first
         if (isSilkPickaxe(mc.player.getMainHandStack())) return true;
-
         if (!autoEquipPickaxe.get()) return false;
 
-        // Scan hotbar
         for (int i = 0; i < 9; i++) {
             if (isSilkPickaxe(mc.player.getInventory().getStack(i))) {
                 mc.player.getInventory().selectedSlot = i;
                 return true;
             }
         }
-        // Scan main inventory → move to hotbar slot 8
         for (int i = 9; i < 36; i++) {
             if (isSilkPickaxe(mc.player.getInventory().getStack(i))) {
                 InvUtils.move().from(i).toHotbar(8);
@@ -394,7 +395,6 @@ public class SpawnerSaver extends Module {
         for (int i = 0; i < 36; i++) {
             ItemStack s = mc.player.getInventory().getStack(i);
             if (!s.isEmpty() && s.getItem() == Items.SPAWNER) {
-                // Translate player inventory slot → screen slot index
                 int screenSlot = i < 9 ? i + 36 : i;
                 InvUtils.shiftClick().slot(screenSlot);
             }
@@ -419,12 +419,8 @@ public class SpawnerSaver extends Module {
         return false;
     }
 
-    // ─── Movement ─────────────────────────────────────────────────────────────
+    // ─── Sneak ────────────────────────────────────────────────────────────────
 
-    /**
-     * Uses mc.options.sneakKey, which always reflects the player's actual bound key.
-     * No hard-coded LSHIFT – works with any rebind.
-     */
     private void startSneak() {
         if (sneaking) return;
         sneaking = true;
@@ -439,20 +435,7 @@ public class SpawnerSaver extends Module {
         mc.player.setSneaking(false);
     }
 
-    private void walkToward(BlockPos dest) {
-        Vec3d playerPos = mc.player.getPos();
-        double dx = (dest.getX() + 0.5) - playerPos.x;
-        double dz = (dest.getZ() + 0.5) - playerPos.z;
-        float  yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-        mc.player.setYaw(yaw);
-        mc.options.forwardKey.setPressed(true);
-    }
-
-    private void stopWalk() {
-        mc.options.forwardKey.setPressed(false);
-    }
-
-    // ─── Helpers ──────────────────────────────────────────────────────────────
+    // ─── Utility ──────────────────────────────────────────────────────────────
 
     private void notify(String msg) {
         if (notifications.get())
