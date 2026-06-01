@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "tot",
+  "version": "${version}",
+  "name": "ToT",
+  "description": "Spawner Saver addon for Meteor Client.",
+  "authors": ["YourName"],
+  "contact": {
+    "sources": "https://github.com/yourusername/tot-addon"
+  },
+  "license": "MIT",
+  "icon": "assets/tot/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.tot.addon.ToT"
+    ]
+  },
+  "mixins": [
+    "tot.mixins.json"
+  ],
+  "depends": {
+    "minecraft": ">=1.21",
+    "meteor-client": "*"
+  }
+}
